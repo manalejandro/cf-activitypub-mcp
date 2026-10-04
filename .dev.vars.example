@@ -1,0 +1,9 @@
+# Copy this file to `.dev.vars` for local development.
+#
+# Operator token of the CF ActivityPub instance. It must match the ADMIN_TOKEN
+# secret configured in the cf-activitypub-next worker.
+ADMIN_TOKEN=change-me
+
+# Bearer token that MCP clients must present to /mcp and /sse.
+# Generate one with: openssl rand -hex 32
+MCP_AUTH_TOKEN=change-me-too
