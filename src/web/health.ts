@@ -1,3 +1,4 @@
+import { getAgentByName } from "agents";
 import { ActivityPubClient } from "../activitypub/client";
 import type { InstanceV2 } from "../activitypub/types";
 import type { AppEnv } from "../config";
@@ -5,6 +6,16 @@ import { readConfig } from "../config";
 import { toolNames } from "../mcp/server";
 
 export type OverallStatus = "ok" | "degraded";
+
+export interface SentinelHealth {
+	enabled: boolean;
+	mode: string;
+	last_run_at: string | null;
+	last_run_status: string | null;
+	decisions_total: number;
+	neurons_today: number;
+	daily_neuron_budget: number;
+}
 
 export interface HealthReport {
 	status: OverallStatus;
@@ -34,9 +45,14 @@ export interface HealthReport {
 		users: number | null;
 		error?: string;
 	};
+	sentinel: SentinelHealth | null;
 }
 
 const HEALTH_TIMEOUT_MS = 5_000;
+const SENTINEL_CACHE_MS = 60_000;
+
+/** In-memory cache so health polling does not wake the Durable Object constantly. */
+let sentinelCache: { at: number; value: SentinelHealth | null } | null = null;
 
 /**
  * Collects the public health report shown on the index page and served at
@@ -78,6 +94,7 @@ export async function collectHealth(env: AppEnv): Promise<HealthReport> {
 				users: null,
 				error: "ACTIVITYPUB_URL is not configured",
 			},
+			sentinel: await collectSentinelHealth(env),
 		};
 	}
 
@@ -99,6 +116,7 @@ export async function collectHealth(env: AppEnv): Promise<HealthReport> {
 				description: instance.description ?? null,
 				users: instance.usage?.users?.active_month ?? null,
 			},
+			sentinel: await collectSentinelHealth(env),
 		};
 	} catch (error) {
 		return {
@@ -116,6 +134,36 @@ export async function collectHealth(env: AppEnv): Promise<HealthReport> {
 				users: null,
 				error: error instanceof Error ? error.message : String(error),
 			},
+			sentinel: await collectSentinelHealth(env),
 		};
+	}
+}
+
+/**
+ * Reads the Sentinel status from its Durable Object, caching the result for a
+ * minute so health polling does not keep the agent awake.
+ */
+async function collectSentinelHealth(env: AppEnv): Promise<SentinelHealth | null> {
+	if (!env.SENTINEL) return null;
+	const now = Date.now();
+	if (sentinelCache && now - sentinelCache.at < SENTINEL_CACHE_MS) return sentinelCache.value;
+	try {
+		const agent = await getAgentByName(env.SENTINEL, "default");
+		const status = await agent.getStatus();
+		const value: SentinelHealth = {
+			enabled: status.settings.enabled,
+			mode: status.settings.mode,
+			last_run_at: status.lastRunAt,
+			last_run_status: status.lastRunStatus,
+			decisions_total: status.decisionsTotal,
+			neurons_today: status.usage.neuronsUsed,
+			daily_neuron_budget: status.usage.dailyNeuronBudget,
+		};
+		sentinelCache = { at: now, value };
+		return value;
+	} catch (error) {
+		console.error("[health] sentinel status unavailable:", error);
+		sentinelCache = { at: now, value: null };
+		return null;
 	}
 }

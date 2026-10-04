@@ -46,13 +46,65 @@
 	],
 
 	/**
+	 * Workers AI: powers the Sentinel agent's periodic analysis.
+	 * `remote: true` lets local `wrangler dev` call the real API (AI bindings
+	 * cannot run inside the local simulator). Remove it if you prefer local
+	 * development to fail rather than consume neurons.
+	 * https://developers.cloudflare.com/workers-ai/configuration/bindings/
+	 */
+	"ai": {
+		"binding": "AI",
+		"remote": true
+	},
+
+	/**
+	 * Sentinel agent: one SQLite-backed Durable Object that watches the
+	 * instance on a schedule and can act on its behalf.
+	 * https://developers.cloudflare.com/agents/
+	 */
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SENTINEL",
+				"class_name": "SentinelAgent"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["SentinelAgent"]
+		}
+	],
+
+	/**
 	 * Plain-text variables. Update `ACTIVITYPUB_URL` to the public URL of your
 	 * CF ActivityPub instance before deploying.
 	 */
 	"vars": {
 		"ACTIVITYPUB_URL": "https://social.example.com",
 		"MCP_SERVER_NAME": "cf-activitypub-mcp",
-		"MCP_SERVER_VERSION": "1.0.0"
+		"MCP_SERVER_VERSION": "1.0.0",
+
+		/**
+		 * Sentinel defaults. They seed the agent on first boot; afterwards the
+		 * configuration is managed through the MCP tools and persisted in the
+		 * Durable Object.
+		 */
+		"SENTINEL_ENABLED": "false",
+		"SENTINEL_MODE": "observe",
+		"SENTINEL_INTERVAL_SECONDS": "900",
+		"SENTINEL_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+		"SENTINEL_MAX_ACTIONS": "3",
+		"SENTINEL_MIN_CONFIDENCE": "0.8",
+		"SENTINEL_COOLDOWN_HOURS": "24",
+		/**
+		 * Workers AI budget in neurons per UTC day (0 = unlimited). The free
+		 * Workers plan includes 10,000 neurons/day; checks are skipped once the
+		 * budget is exhausted and resume after 00:00 UTC.
+		 */
+		"SENTINEL_DAILY_NEURON_BUDGET": "10000",
+		"SENTINEL_ALLOWED_ACTIONS": "resolve_report,dismiss_report,silence_account,suspend_account,block_domain,enforce_media_cache"
 		/**
 		 * Optional hardening: comma-separated Host allowlist for the MCP
 		 * endpoints (custom domains). Localhost and workers.dev are always
@@ -63,6 +115,15 @@
 		 * Optional: comma-separated browser Origin allowlist, or `*` when an
 		 * upstream layer validates origins. Needed only for browser clients.
 		 */
-		// "MCP_ALLOWED_ORIGINS": "https://app.example.com"
+		// "MCP_ALLOWED_ORIGINS": "https://app.example.com",
+		/**
+		 * Optional: webhook that receives a JSON summary after every Sentinel
+		 * run (must be a public HTTPS URL).
+		 */
+		// "SENTINEL_NOTIFY_WEBHOOK": "https://hooks.example.com/sentinel",
+		/**
+		 * Optional: domains the Sentinel must never act against.
+		 */
+		// "SENTINEL_PROTECTED_DOMAINS": "mastodon.social,example.com"
 	}
 }

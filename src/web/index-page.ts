@@ -10,6 +10,13 @@ export function renderIndexPage(health: HealthReport): string {
 	const instanceClass = instance.reachable ? "ok" : "down";
 	const latency = instance.reachable && instance.latency_ms !== null ? `${instance.latency_ms} ms` : "—";
 	const users = instance.users === null ? "—" : String(instance.users);
+	const sentinel = health.sentinel;
+	const sentinelMode = sentinelModeLabel(sentinel);
+	const sentinelDetail = sentinel
+		? `${sentinel.decisions_total} decision${sentinel.decisions_total === 1 ? "" : "s"} · ${formatNeurons(
+				sentinel.neurons_today
+			)} neurons today${sentinel.daily_neuron_budget > 0 ? ` / ${formatNeurons(sentinel.daily_neuron_budget)}` : ""}`
+		: "Durable Object agent";
 
 	return `<!doctype html>
 <html lang="en">
@@ -94,6 +101,11 @@ footer a:hover{text-decoration:underline}
         <div class="value" id="instance-users">${users}</div>
         <div class="sub">Reported by the instance</div>
       </div>
+      <div class="card">
+        <div class="label">AI Sentinel</div>
+        <div class="value" id="sentinel-mode">${sentinelMode}</div>
+        <div class="sub" id="sentinel-detail">${sentinelDetail}</div>
+      </div>
     </div>
   </section>
 
@@ -121,6 +133,19 @@ footer a:hover{text-decoration:underline}
     var el = document.getElementById(id);
     if (el && value !== undefined && value !== null) el.textContent = String(value);
   }
+  function sentinelModeLabel(sentinel) {
+    if (!sentinel) return "Unavailable";
+    if (!sentinel.enabled) return "Paused";
+    if (sentinel.mode === "enforce") return "Enforcing";
+    if (sentinel.mode === "suggest") return "Suggesting";
+    return "Observing";
+  }
+  function formatNeurons(value) {
+    if (!value || value <= 0) return "0";
+    if (value < 1000) return String(Math.round(value));
+    if (value < 1000000) return (value / 1000).toFixed(value < 10000 ? 1 : 0) + "k";
+    return (value / 1000000).toFixed(1) + "M";
+  }
   function refresh() {
     fetch("/health", { headers: { accept: "application/json" }, cache: "no-store" })
       .then(function (res) { return res.ok ? res.json() : null; })
@@ -136,6 +161,11 @@ footer a:hover{text-decoration:underline}
         text("mcp-version", "v" + (data.service && data.service.version ? data.service.version : ""));
         text("mcp-tools", data.service ? data.service.tools + " tools · bearer auth" : "");
         text("checked-at", new Date(data.timestamp).toLocaleTimeString());
+        var sentinel = data.sentinel || null;
+        text("sentinel-mode", sentinelModeLabel(sentinel));
+        text("sentinel-detail", sentinel
+          ? sentinel.decisions_total + " decision" + (sentinel.decisions_total === 1 ? "" : "s") + " · " + formatNeurons(sentinel.neurons_today) + " neurons today" + (sentinel.daily_neuron_budget > 0 ? " / " + formatNeurons(sentinel.daily_neuron_budget) : "")
+          : "Durable Object agent");
       })
       .catch(function () {});
   }
@@ -154,4 +184,19 @@ function escapeHtml(value: string): string {
 		.replace(/>/g, "&gt;")
 		.replace(/"/g, "&quot;")
 		.replace(/'/g, "&#39;");
+}
+
+function sentinelModeLabel(sentinel: HealthReport["sentinel"]): string {
+	if (!sentinel) return "Unavailable";
+	if (!sentinel.enabled) return "Paused";
+	if (sentinel.mode === "enforce") return "Enforcing";
+	if (sentinel.mode === "suggest") return "Suggesting";
+	return "Observing";
+}
+
+function formatNeurons(value: number): string {
+	if (!Number.isFinite(value) || value <= 0) return "0";
+	if (value < 1_000) return String(Math.round(value));
+	if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}k`;
+	return `${(value / 1_000_000).toFixed(1)}M`;
 }

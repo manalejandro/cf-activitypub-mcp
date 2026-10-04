@@ -6,6 +6,10 @@ import { createMcpServer } from "./mcp/server";
 import { collectHealth } from "./web/health";
 import { renderIndexPage } from "./web/index-page";
 
+// Durable Object class for the AI Sentinel (Centinela). It must be exported
+// from the worker entry point so Wrangler can register it.
+export { SentinelAgent } from "./sentinel/agent";
+
 /**
  * CF ActivityPub MCP — a remote Model Context Protocol server that exposes the
  * administration API of a CF ActivityPub instance to AI assistants.
@@ -84,7 +88,7 @@ async function handleMcp(
 		});
 	}
 
-	const toolContext = new ToolContext(config);
+	const toolContext = new ToolContext(config, env);
 	const handler = createMcpHandler(() => createMcpServer(toolContext), {
 		route: pathname,
 		// `/mcp` answers with JSON and upgrades to SSE only when needed;

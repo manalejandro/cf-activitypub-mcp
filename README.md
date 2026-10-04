@@ -16,14 +16,15 @@
 
 Point it at your instance with the same `ADMIN_TOKEN` operator secret, connect any MCP-capable assistant, and manage accounts, reports, federation rules, relays, media cache, settings and more through natural conversation. The worker:
 
-- Exposes the full administration surface as **30 well-described MCP tools**.
+- Exposes the full administration surface as **35 well-described MCP tools**.
+- Includes **Centinela**, an AI watchdog running on **Cloudflare Durable Objects** that reviews the instance on a schedule, asks **Workers AI** for an analysis and can propose or execute guarded actions.
 - Speaks **Streamable HTTP** (`/mcp`, JSON responses) and an **SSE-shaped endpoint** (`/sse`) for clients that require it.
 - Requires its own **bearer token** (`MCP_AUTH_TOKEN`) on every MCP request, independent from the instance token.
-- Publishes a **public landing page** and a **`/health` JSON report** with live metrics.
+- Publishes a **public landing page** and a **`/health` JSON report** with live metrics, including the Sentinel state.
 - Runs with **Cloudflare observability** (traces, logs and real-time issues) enabled.
 - Deploys to a **custom domain** with a single `wrangler deploy`.
 
-> The MCP never stores instance data: every tool call is a thin, authenticated proxy to the CF ActivityPub admin API, which keeps its own audit trail.
+> The MCP never stores instance data: every tool call is a thin, authenticated proxy to the CF ActivityPub admin API, which keeps its own audit trail. Centinela stores only its own configuration, run history and decisions inside its Durable Object.
 
 ## Architecture
 
@@ -34,6 +35,7 @@ Point it at your instance with the same `ADMIN_TOKEN` operator secret, connect a
 | Protocols | Streamable HTTP + SSE response shaping, JSON-RPC 2.0 |
 | Authentication | Bearer token (`MCP_AUTH_TOKEN`) with constant-time comparison |
 | Upstream | CF ActivityPub admin API (`ADMIN_TOKEN`) |
+| AI Sentinel | Cloudflare Durable Objects (SQLite-backed) + Agents SDK scheduling + Workers AI |
 | Observability | Workers Logs, Traces and Issues |
 | Language | TypeScript, Zod schemas |
 
@@ -52,7 +54,7 @@ Modern protocol revisions (`2026-07-28`) receive JSON responses; legacy clients 
 ## Requirements
 
 - A deployed **CF ActivityPub Next** instance with `ADMIN_TOKEN` configured (`wrangler secret put ADMIN_TOKEN` in that project).
-- A **Cloudflare account** with the domain you want to use.
+- A **Cloudflare account** with the domain you want to use. Centinela additionally uses **Workers AI** (available on the free plan with a daily neuron allowance) and one **Durable Object**.
 - **Node.js 20+** and npm.
 
 ## Quick start
@@ -88,6 +90,8 @@ For local development, copy `.dev.vars.example` to `.dev.vars` and fill in both 
 | `MCP_SERVER_VERSION` | No | Version reported by the MCP server (default `1.0.0`) |
 | `MCP_ALLOWED_HOSTNAMES` | No | Comma-separated Host allowlist for the MCP endpoints. Localhost and `workers.dev` are always accepted when unset |
 | `MCP_ALLOWED_ORIGINS` | No | Comma-separated browser Origin allowlist, or `*` when an upstream layer validates origins. Only needed for browser-based MCP clients |
+
+The `SENTINEL_*` variables that seed Centinela are documented in [AI Sentinel (Centinela)](#ai-sentinel-centinela).
 
 ### Secrets (`wrangler secret put`)
 
@@ -153,7 +157,7 @@ npx @modelcontextprotocol/inspector
 
 ## Tools
 
-The server exposes 30 tools, grouped by administrative domain. Destructive actions (`delete`, `reject`, `suspend`, `demote`, `purge`, `clear_all`, `remove`, `dismiss`) require an explicit `confirm: true` argument, so an assistant cannot destroy data by accident.
+The server exposes 35 tools, grouped by administrative domain. Destructive actions (`delete`, `reject`, `suspend`, `demote`, `purge`, `clear_all`, `remove`, `dismiss`) require an explicit `confirm: true` argument, so an assistant cannot destroy data by accident.
 
 ### Overview and health
 
@@ -220,33 +224,109 @@ The server exposes 30 tools, grouped by administrative domain. Destructive actio
 | `get_moderation_log` | Audit trail with target/action filters |
 | `manage_moderation_log` | delete_entry, clear_all |
 
+### AI Sentinel (Centinela)
+
+| Tool | Description |
+|---|---|
+| `get_sentinel_status` | Configuration, AI usage ledger, last run, next check and decision totals |
+| `configure_sentinel` | Mode, interval, model, thresholds, allow-list, protected domains, webhook |
+| `run_sentinel_check` | Runs an analysis immediately (respects the current mode) |
+| `get_sentinel_decisions` | Decision history with status, target, confidence and result |
+| `clear_sentinel_decisions` | Deletes the decision and run history (requires confirmation) |
+
 ### Known limitations
 
 - `manage_report` with `action: "add_note"` needs an OAuth token owned by a local actor; the shared `ADMIN_TOKEN` cannot author notes and the instance answers `401`.
 - Announcement listing is actor-only on the instance, so this MCP can create and delete announcements but not list them.
 - The MCP never exposes the instance database directly; it is limited to what the admin API supports.
 
+## AI Sentinel (Centinela)
+
+Centinela is an autonomous watchdog that lives in a **SQLite-backed Durable Object** and wakes up on a schedule managed by the [Agents SDK](https://developers.cloudflare.com/agents/) (backed by Durable Object alarms).
+
+On every check it:
+
+1. Collects a compact snapshot through the admin API: instance health, counters, pending registrations, open reports, problem federated instances, domain blocks, media cache pressure and the recent moderation log.
+2. Asks **Workers AI** (JSON mode) for a structured analysis: summary, severity, findings and proposed actions.
+3. Applies **deterministic guardrails** in code — not in the prompt — and then records, proposes or executes the surviving actions depending on the configured mode.
+
+### Modes
+
+| Mode | Behavior |
+|---|---|
+| `observe` | Analyses and records findings only. Nothing is proposed or executed. |
+| `suggest` | Records proposed actions so the operator can review them, but never calls the instance API. |
+| `enforce` | Executes actions that pass every guardrail. |
+
+`enforce` is powerful: start in `observe`, review the decision history, then move to `suggest` and only then to `enforce` with a narrow allow-list.
+
+### Guardrails
+
+- **Action allow-list.** Only `resolve_report`, `dismiss_report`, `silence_account`, `suspend_account`, `block_domain` and `enforce_media_cache` exist, and the operator chooses which are enabled.
+- **Per-action confidence floors** combined with the configured `minConfidence` (for example, suspending an account or blocking a domain requires ≥ 0.9 by default).
+- **Per-run budget.** At most `maxActionsPerRun` actions are executed per check.
+- **Daily neuron budget.** The Sentinel estimates the neuron cost of every Workers AI call from the provider token counts and the official per-model rates. When `dailyNeuronBudget` is reached (UTC day, matching Cloudflare's reset at 00:00 UTC), scheduled checks are skipped and recorded until the next day. Set it to `0` for unlimited usage.
+- **Cooldowns.** The same action against the same target is not repeated within `cooldownHours` (24 by default).
+- **Protected targets.** Administrators and moderators can never be silenced or suspended; protected domains can never be blocked; already-blocked domains and already-moderated accounts are skipped.
+- **Prompt-injection defense.** Report comments, registration reasons and display names are treated as untrusted data, and the guardrails run in code so a manipulated model cannot exceed its mandate.
+- **Audit trail.** Every run and decision is stored in the Durable Object with status `observed`, `proposed`, `blocked`, `executed` or `failed`.
+
+### Configuration
+
+The agent is seeded on first boot from `wrangler.jsonc` variables and can then be reconfigured live through `configure_sentinel`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SENTINEL_ENABLED` | `false` | Start the periodic schedule |
+| `SENTINEL_MODE` | `observe` | `observe`, `suggest` or `enforce` |
+| `SENTINEL_INTERVAL_SECONDS` | `900` | Seconds between checks (60 – 86400) |
+| `SENTINEL_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Workers AI model |
+| `SENTINEL_MAX_ACTIONS` | `3` | Hard cap of executed actions per run |
+| `SENTINEL_MIN_CONFIDENCE` | `0.8` | Minimum model confidence |
+| `SENTINEL_COOLDOWN_HOURS` | `24` | Cooldown window per action+target |
+| `SENTINEL_DAILY_NEURON_BUDGET` | `10000` | Workers AI budget in neurons per UTC day (`0` = unlimited) |
+| `SENTINEL_ALLOWED_ACTIONS` | all actions | Comma-separated allow-list |
+| `SENTINEL_PROTECTED_DOMAINS` | empty | Domains the Sentinel must never act against |
+| `SENTINEL_NOTIFY_WEBHOOK` | empty | HTTPS webhook that receives a JSON summary after each run |
+
+A typical first configuration from an MCP client:
+
+```text
+configure_sentinel { "enabled": true, "mode": "suggest", "interval_seconds": 3600, "daily_neuron_budget": 10000 }
+run_sentinel_check {}
+get_sentinel_decisions { "limit": 20 }
+```
+
+`get_sentinel_status` reports the live ledger: `usage.neuronsUsed`, `usage.dailyNeuronBudget`, `usage.remaining`, `usage.runs` and token totals for the current UTC day. The budget is a safety valve, not an exact invoice: usage is estimated from the token counts the model returns (or from text length when the model omits them) and the published per-model rates.
+
+> **Local development:** the local simulator cannot execute Workers AI bindings, so Sentinel checks in `wrangler dev` are recorded as errors and do not consume neurons. Deploy the worker (or use `wrangler dev --remote` with a publicly reachable `ACTIVITYPUB_URL`) to exercise the model.
+
+> Centinela complements the instance's own **Guardian**: the Guardian moderates content inside CF ActivityPub, while Centinela watches the instance as an operator would and acts through the admin API. Both keep their own audit trails.
+
 ## Health and landing page
 
-- `GET /` renders a public landing page linking to both repositories and showing live metrics (worker status, instance status, latency, active users, tool count).
+- `GET /` renders a public landing page linking to both repositories and showing live metrics (worker status, instance status, latency, active users, tool count and Sentinel mode).
 - `GET /health` returns the same data as JSON, suitable for uptime monitors:
 
 ```json
 {
 	"status": "ok",
-	"service": { "name": "cf-activitypub-mcp", "version": "1.0.0", "tools": 30, "authentication": "bearer" },
-	"instance": { "url": "https://social.example.com", "reachable": true, "latency_ms": 42, "users": 128 }
+	"service": { "name": "cf-activitypub-mcp", "version": "1.0.0", "tools": 35, "authentication": "bearer" },
+	"instance": { "url": "https://social.example.com", "reachable": true, "latency_ms": 42, "users": 128 },
+	"sentinel": { "enabled": true, "mode": "suggest", "last_run_at": "2026-10-04T04:00:00.000Z", "last_run_status": "ok", "decisions_total": 12, "neurons_today": 843, "daily_neuron_budget": 10000 }
 }
 ```
 
-No secrets or administrative details are exposed by either endpoint.
+No secrets or administrative details are exposed by either endpoint. The Sentinel section is read through its Durable Object and cached for a minute so health polling does not keep the agent awake.
 
 ## Security
 
 - **Fail closed.** MCP endpoints refuse to serve when `MCP_AUTH_TOKEN` is missing.
 - **Least privilege.** The MCP only knows the instance admin API; it cannot reach Cloudflare account resources.
-- **Auditability.** Every mutation performed through the MCP is recorded by the instance in its moderation log.
+- **Auditability.** Every mutation performed through the MCP is recorded by the instance in its moderation log; Centinela keeps its own decision history.
 - **Confirmation guards.** Destructive tools require `confirm: true`; the model must be told explicitly.
+- **Sentinel guardrails.** The AI never executes an action outside the allow-list, below the confidence floor, over the per-run budget or against protected accounts and domains. Guardrails run in code, not in the prompt.
+- **Prompt-injection defense.** Snapshot content is treated as untrusted data and never as instructions.
 - **Constant-time token comparison.** Candidate and expected tokens are hashed and compared with an XOR accumulator.
 - **Origin/Host allowlists.** Optional `MCP_ALLOWED_ORIGINS` / `MCP_ALLOWED_HOSTNAMES` restrict browser and Host access.
 - **Source maps.** `upload_source_maps` keeps stack traces readable in the dashboard without shipping them to clients.
@@ -268,7 +348,7 @@ If you find a security issue, please open a private report through GitHub rather
 
 ```
 src/
-  index.ts                  Worker entry: routing, auth, endpoints
+  index.ts                  Worker entry: routing, auth, endpoints, DO export
   config.ts                 Environment parsing and defaults
   auth.ts                   Bearer authentication and secret comparison
   activitypub/
@@ -276,15 +356,24 @@ src/
     types.ts                Shared API payload shapes
   mcp/
     server.ts               MCP server factory and tool catalogue
-    context.ts              Per-request tool context (lazy clients)
+    context.ts              Per-request tool context (lazy clients + env)
     result.ts               Tool result helpers
     tools/                  One module per administrative domain
+  sentinel/
+    agent.ts                Centinela: SQLite-backed Durable Object agent
+    analyze.ts              Workers AI prompt and structured analysis
+    snapshot.ts             Instance snapshot collection
+    policy.ts               Deterministic guardrails and settings validation
+    defaults.ts             Environment-seeded configuration
+    types.ts                Sentinel types and action catalogue
   web/
-    health.ts               Health report collection
+    health.ts               Health report collection (includes Sentinel)
     index-page.ts           Public landing page renderer
 test/
   index.spec.ts             Worker routes and MCP protocol tests
   config.spec.ts            Config and auth unit tests
+  client.spec.ts            ActivityPub client unit tests
+  sentinel.spec.ts          Sentinel policy, analysis and Durable Object tests
 ```
 
 ## Deployment notes
@@ -295,7 +384,7 @@ test/
 4. Run `npm run deploy`, then open `https://mcp.example.com/` to verify the health metrics.
 5. Observability is already enabled: traces, logs and real-time issues are available in the Cloudflare dashboard under the worker's **Observability** tab.
 
-The worker requires no Durable Objects, KV, R2 or D1 bindings — it is stateless and works entirely through the instance API.
+The first deploy applies the `v1` migration and creates the SQLite-backed `SentinelAgent` Durable Object class. The MCP tool endpoints themselves stay stateless and work entirely through the instance API; only Centinela uses Durable Object storage, Workers AI and alarms.
 
 ## License
 

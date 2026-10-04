@@ -1,12 +1,15 @@
 import { ActivityPubClient, ConfigError } from "../activitypub/client";
-import type { McpConfig } from "../config";
+import type { AppEnv, McpConfig } from "../config";
 
 /**
  * Per-request tool context. Clients are created lazily so a tool call fails
  * with a precise configuration error instead of the worker refusing to boot.
  */
 export class ToolContext {
-	constructor(readonly config: McpConfig) {}
+	constructor(
+		readonly config: McpConfig,
+		readonly env: AppEnv = {}
+	) {}
 
 	/** Authenticated client (instance admin API). */
 	admin(): ActivityPubClient {

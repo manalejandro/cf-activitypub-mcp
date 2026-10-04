@@ -72,10 +72,13 @@ describe("worker routes", () => {
 		const health = (await response.json()) as {
 			service: { tools: number; configured: Record<string, boolean> };
 			instance: { url: string };
+			sentinel: unknown;
 		};
-		expect(health.service.tools).toBeGreaterThanOrEqual(30);
+		expect(health.service.tools).toBeGreaterThanOrEqual(35);
 		expect(health.service.configured.instance_url).toBe(true);
 		expect(health.instance.url).toBe("http://127.0.0.1:9");
+		// The test environment does not configure the SENTINEL binding.
+		expect(health.sentinel).toBeNull();
 	});
 
 	it("reports missing configuration without leaking secrets", async () => {
@@ -119,10 +122,13 @@ describe("mcp protocol", () => {
 		expect(response.headers.get("Content-Type")).toContain("application/json");
 		const payload = (await response.json()) as { result: { tools: { name: string }[] } };
 		const names = payload.result.tools.map((tool) => tool.name);
-		expect(names).toHaveLength(30);
+		expect(names).toHaveLength(35);
 		expect(names).toContain("get_instance_overview");
 		expect(names).toContain("moderate_account");
 		expect(names).toContain("manage_media_cache");
+		expect(names).toContain("get_sentinel_status");
+		expect(names).toContain("configure_sentinel");
+		expect(names).toContain("run_sentinel_check");
 	});
 
 	it("accepts a legacy initialize handshake", async () => {

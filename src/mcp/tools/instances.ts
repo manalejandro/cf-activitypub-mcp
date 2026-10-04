@@ -17,9 +17,11 @@ export function registerInstanceTools(server: McpServer, ctx: ToolContext): stri
 			inputSchema: z.object({
 				query: z.string().optional().describe("Match on the instance domain."),
 				status: z
-					.enum(["all", "healthy", "unreachable", "suspended", "dormant"])
+					.enum(["all", "ok", "unavailable", "blocked", "suspended", "dormant"])
 					.default("all")
-					.describe("Filter by registry status."),
+					.describe(
+						"Filter by registry status: `ok` (reachable and not blocked), `unavailable` (delivery failures), `blocked` (domain block), `suspended`, `dormant` (no activity recently) or `all`."
+					),
 				limit: z.number().int().min(1).max(200).default(40).describe("Instances per page."),
 				page: z.number().int().min(1).default(1).describe("1-based page number."),
 			}),

@@ -29,5 +29,10 @@ export interface MediaCachePayload {
 
 export interface Paginated<T> {
 	total?: number;
+	accounts?: T[];
+	reports?: T[];
+	log?: T[];
+	instances?: T[];
+	relays?: T[];
 	[key: string]: unknown;
 }

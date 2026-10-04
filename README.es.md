@@ -16,14 +16,15 @@
 
 Apunta el worker a tu instancia con el mismo secreto de operador `ADMIN_TOKEN`, conecta cualquier asistente compatible con MCP y gestiona cuentas, reportes, reglas de federación, relays, caché de medios, ajustes y mucho más mediante conversación natural. El worker:
 
-- Expone toda la superficie de administración como **30 herramientas MCP bien descritas**.
+- Expone toda la superficie de administración como **35 herramientas MCP bien descritas**.
+- Incluye **Centinela**, un vigilante de IA que se ejecuta en **Durable Objects de Cloudflare**, revisa la instancia periódicamente, pide un análisis a **Workers AI** y puede proponer o ejecutar acciones con guardarraíles.
 - Habla **Streamable HTTP** (`/mcp`, respuestas JSON) y un **endpoint con formato SSE** (`/sse`) para clientes que lo requieran.
 - Exige su propio **token bearer** (`MCP_AUTH_TOKEN`) en cada petición MCP, independiente del token de la instancia.
-- Publica una **página de inicio pública** y un **informe JSON en `/health`** con métricas en vivo.
+- Publica una **página de inicio pública** y un **informe JSON en `/health`** con métricas en vivo, incluido el estado del Centinela.
 - Funciona con la **observabilidad de Cloudflare** (traces, logs e issues en tiempo real) habilitada.
 - Se despliega en un **dominio personalizado** con un solo `wrangler deploy`.
 
-> El MCP nunca almacena datos de la instancia: cada llamada a herramienta es un proxy autenticado y ligero hacia la API de administración de CF ActivityPub, que mantiene su propia auditoría.
+> El MCP nunca almacena datos de la instancia: cada llamada a herramienta es un proxy autenticado y ligero hacia la API de administración de CF ActivityPub, que mantiene su propia auditoría. Centinela solo guarda su propia configuración, historial de ejecuciones y decisiones dentro de su Durable Object.
 
 ## Arquitectura
 
@@ -34,6 +35,7 @@ Apunta el worker a tu instancia con el mismo secreto de operador `ADMIN_TOKEN`, 
 | Protocolos | Streamable HTTP + formato SSE, JSON-RPC 2.0 |
 | Autenticación | Token bearer (`MCP_AUTH_TOKEN`) con comparación de tiempo constante |
 | Upstream | API de administración de CF ActivityPub (`ADMIN_TOKEN`) |
+| Centinela de IA | Cloudflare Durable Objects (SQLite) + planificación del Agents SDK + Workers AI |
 | Observabilidad | Workers Logs, Traces e Issues |
 | Lenguaje | TypeScript, esquemas Zod |
 
@@ -52,7 +54,7 @@ Las revisiones modernas del protocolo (`2026-07-28`) reciben respuestas JSON; lo
 ## Requisitos
 
 - Una instancia de **CF ActivityPub Next** desplegada con `ADMIN_TOKEN` configurado (`wrangler secret put ADMIN_TOKEN` en ese proyecto).
-- Una **cuenta de Cloudflare** con el dominio que quieras usar.
+- Una **cuenta de Cloudflare** con el dominio que quieras usar. Centinela usa además **Workers AI** (disponible en el plan gratuito con una asignación diaria de neuronas) y un **Durable Object**.
 - **Node.js 20+** y npm.
 
 ## Inicio rápido
@@ -88,6 +90,8 @@ Para desarrollo local, copia `.dev.vars.example` a `.dev.vars` y rellena ambos t
 | `MCP_SERVER_VERSION` | No | Versión que reporta el servidor MCP (por defecto `1.0.0`) |
 | `MCP_ALLOWED_HOSTNAMES` | No | Lista de Hosts permitidos separados por comas para los endpoints MCP. Localhost y `workers.dev` siempre se aceptan si no se define |
 | `MCP_ALLOWED_ORIGINS` | No | Lista de Origins de navegador permitidos separados por comas, o `*` cuando una capa superior valida los orígenes. Solo es necesario para clientes MCP basados en navegador |
+
+Las variables `SENTINEL_*` que siembran la configuración de Centinela se documentan en [Centinela (AI Sentinel)](#centinela-ai-sentinel).
 
 ### Secretos (`wrangler secret put`)
 
@@ -153,7 +157,7 @@ npx @modelcontextprotocol/inspector
 
 ## Herramientas
 
-El servidor expone 30 herramientas, agrupadas por dominio administrativo. Las acciones destructivas (`delete`, `reject`, `suspend`, `demote`, `purge`, `clear_all`, `remove`, `dismiss`) requieren un argumento explícito `confirm: true`, de modo que un asistente no puede destruir datos por accidente.
+El servidor expone 35 herramientas, agrupadas por dominio administrativo. Las acciones destructivas (`delete`, `reject`, `suspend`, `demote`, `purge`, `clear_all`, `remove`, `dismiss`) requieren un argumento explícito `confirm: true`, de modo que un asistente no puede destruir datos por accidente.
 
 ### Resumen y salud
 
@@ -220,33 +224,109 @@ El servidor expone 30 herramientas, agrupadas por dominio administrativo. Las ac
 | `get_moderation_log` | Auditoría con filtros por objetivo/acción |
 | `manage_moderation_log` | delete_entry, clear_all |
 
+### Centinela (AI Sentinel)
+
+| Herramienta | Descripción |
+|---|---|
+| `get_sentinel_status` | Configuración, libro de uso de IA, última ejecución, próximo chequeo y totales de decisiones |
+| `configure_sentinel` | Modo, intervalo, modelo, umbrales, allow-list, dominios protegidos, webhook |
+| `run_sentinel_check` | Ejecuta un análisis inmediato (respeta el modo actual) |
+| `get_sentinel_decisions` | Historial de decisiones con estado, objetivo, confianza y resultado |
+| `clear_sentinel_decisions` | Borra el historial de decisiones y ejecuciones (requiere confirmación) |
+
 ### Limitaciones conocidas
 
 - `manage_report` con `action: "add_note"` necesita un token OAuth propiedad de un actor local; el `ADMIN_TOKEN` compartido no puede crear notas y la instancia responde `401`.
 - El listado de anuncios en la instancia es solo para actores autenticados, por lo que este MCP puede crear y eliminar anuncios, pero no listarlos.
 - El MCP nunca accede directamente a la base de datos de la instancia; se limita a lo que permite la API de administración.
 
+## Centinela (AI Sentinel)
+
+Centinela es un vigilante autónomo que vive en un **Durable Object con SQLite** y despierta según una planificación gestionada por el [Agents SDK](https://developers.cloudflare.com/agents/) (basada en alarmas de Durable Objects).
+
+En cada chequeo:
+
+1. Recopila un snapshot compacto a través de la API de administración: salud de la instancia, contadores, registros pendientes, reportes abiertos, instancias federadas problemáticas, bloqueos de dominio, presión de la caché de medios y el log de moderación reciente.
+2. Pide a **Workers AI** (modo JSON) un análisis estructurado: resumen, severidad, hallazgos y acciones propuestas.
+3. Aplica **guardarraíles deterministas** en código — no en el prompt — y después registra, propone o ejecuta las acciones que sobreviven según el modo configurado.
+
+### Modos
+
+| Modo | Comportamiento |
+|---|---|
+| `observe` | Solo analiza y registra hallazgos. No propone ni ejecuta nada. |
+| `suggest` | Registra las acciones propuestas para que el operador las revise, pero nunca llama a la API de la instancia. |
+| `enforce` | Ejecuta las acciones que superan todos los guardarraíles. |
+
+`enforce` es potente: empieza en `observe`, revisa el historial de decisiones, pasa a `suggest` y solo después a `enforce` con una allow-list estrecha.
+
+### Guardarraíles
+
+- **Allow-list de acciones.** Solo existen `resolve_report`, `dismiss_report`, `silence_account`, `suspend_account`, `block_domain` y `enforce_media_cache`, y el operador elige cuáles están habilitadas.
+- **Umbrales de confianza por acción** combinados con `minConfidence` (por ejemplo, suspender una cuenta o bloquear un dominio exige ≥ 0.9 por defecto).
+- **Presupuesto por ejecución.** Como máximo se ejecutan `maxActionsPerRun` acciones por chequeo.
+- **Presupuesto diario de neuronas.** El Centinela estima el coste en neuronas de cada llamada a Workers AI a partir de los tokens que devuelve el proveedor y de las tarifas oficiales por modelo. Cuando se alcanza `dailyNeuronBudget` (día UTC, igual que el reinicio de Cloudflare a las 00:00 UTC), los chequeos programados se omiten y quedan registrados hasta el día siguiente. Usa `0` para consumo ilimitado.
+- **Enfriamiento (cooldown).** La misma acción contra el mismo objetivo no se repite dentro de `cooldownHours` (24 por defecto).
+- **Objetivos protegidos.** Los administradores y moderadores nunca pueden ser silenciados ni suspendidos; los dominios protegidos nunca se bloquean; los dominios ya bloqueados y las cuentas ya moderadas se omiten.
+- **Defensa contra inyección de prompt.** Los comentarios de reportes, motivos de registro y nombres visibles se tratan como datos no confiables, y los guardarraíles se ejecutan en código, así que un modelo manipulado no puede exceder su mandato.
+- **Auditoría.** Cada ejecución y decisión se guarda en el Durable Object con estado `observed`, `proposed`, `blocked`, `executed` o `failed`.
+
+### Configuración
+
+El agente se siembra en el primer arranque desde las variables de `wrangler.jsonc` y luego puede reconfigurarse en vivo con `configure_sentinel`:
+
+| Variable | Por defecto | Descripción |
+|---|---|---|
+| `SENTINEL_ENABLED` | `false` | Inicia la planificación periódica |
+| `SENTINEL_MODE` | `observe` | `observe`, `suggest` o `enforce` |
+| `SENTINEL_INTERVAL_SECONDS` | `900` | Segundos entre chequeos (60 – 86400) |
+| `SENTINEL_MODEL` | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Modelo de Workers AI |
+| `SENTINEL_MAX_ACTIONS` | `3` | Límite duro de acciones ejecutadas por ejecución |
+| `SENTINEL_MIN_CONFIDENCE` | `0.8` | Confianza mínima del modelo |
+| `SENTINEL_COOLDOWN_HOURS` | `24` | Ventana de enfriamiento por acción+objetivo |
+| `SENTINEL_DAILY_NEURON_BUDGET` | `10000` | Presupuesto de Workers AI en neuronas por día UTC (`0` = ilimitado) |
+| `SENTINEL_ALLOWED_ACTIONS` | todas | Allow-list separada por comas |
+| `SENTINEL_PROTECTED_DOMAINS` | vacío | Dominios contra los que el Centinela nunca debe actuar |
+| `SENTINEL_NOTIFY_WEBHOOK` | vacío | Webhook HTTPS que recibe un resumen JSON tras cada ejecución |
+
+Una primera configuración típica desde un cliente MCP:
+
+```text
+configure_sentinel { "enabled": true, "mode": "suggest", "interval_seconds": 3600, "daily_neuron_budget": 10000 }
+run_sentinel_check {}
+get_sentinel_decisions { "limit": 20 }
+```
+
+`get_sentinel_status` informa del libro de uso en vivo: `usage.neuronsUsed`, `usage.dailyNeuronBudget`, `usage.remaining`, `usage.runs` y totales de tokens del día UTC actual. El presupuesto es una válvula de seguridad, no una factura exacta: el uso se estima a partir de los tokens que devuelve el modelo (o de la longitud del texto cuando no los incluye) y de las tarifas publicadas por modelo.
+
+> **Desarrollo local:** el simulador local no puede ejecutar bindings de Workers AI, así que los chequeos del Centinela en `wrangler dev` se registran como errores y no consumen neuronas. Despliega el worker (o usa `wrangler dev --remote` con una `ACTIVITYPUB_URL` públicamente accesible) para probar el modelo.
+
+> Centinela complementa al **Guardian** de la propia instancia: el Guardian modera contenido dentro de CF ActivityPub, mientras que Centinela observa la instancia como lo haría un operador y actúa a través de la API de administración. Ambos mantienen sus propias auditorías.
+
 ## Salud y página de inicio
 
-- `GET /` renderiza una página pública que enlaza ambos repositorios y muestra métricas en vivo (estado del worker, estado de la instancia, latencia, usuarios activos, número de herramientas).
+- `GET /` renderiza una página pública que enlaza ambos repositorios y muestra métricas en vivo (estado del worker, estado de la instancia, latencia, usuarios activos, número de herramientas y modo del Centinela).
 - `GET /health` devuelve los mismos datos en JSON, apto para monitores de disponibilidad:
 
 ```json
 {
 	"status": "ok",
-	"service": { "name": "cf-activitypub-mcp", "version": "1.0.0", "tools": 30, "authentication": "bearer" },
-	"instance": { "url": "https://social.example.com", "reachable": true, "latency_ms": 42, "users": 128 }
+	"service": { "name": "cf-activitypub-mcp", "version": "1.0.0", "tools": 35, "authentication": "bearer" },
+	"instance": { "url": "https://social.example.com", "reachable": true, "latency_ms": 42, "users": 128 },
+	"sentinel": { "enabled": true, "mode": "suggest", "last_run_at": "2026-10-04T04:00:00.000Z", "last_run_status": "ok", "decisions_total": 12, "neurons_today": 843, "daily_neuron_budget": 10000 }
 }
 ```
 
-Ninguno de los dos endpoints expone secretos ni detalles administrativos.
+Ninguno de los dos endpoints expone secretos ni detalles administrativos. La sección del Centinela se lee de su Durable Object y se cachea un minuto para que el sondeo de salud no mantenga al agente despierto.
 
 ## Seguridad
 
 - **Fallo cerrado.** Los endpoints MCP se niegan a servir cuando falta `MCP_AUTH_TOKEN`.
 - **Mínimo privilegio.** El MCP solo conoce la API de administración de la instancia; no puede acceder a recursos de la cuenta de Cloudflare.
-- **Auditoría.** Cada mutación realizada a través del MCP queda registrada por la instancia en su log de moderación.
+- **Auditoría.** Cada mutación realizada a través del MCP queda registrada por la instancia en su log de moderación; el Centinela mantiene su propio historial de decisiones.
 - **Guardas de confirmación.** Las herramientas destructivas requieren `confirm: true`; el modelo debe recibir la orden explícita.
+- **Guardarraíles del Centinela.** La IA nunca ejecuta una acción fuera de la allow-list, por debajo del umbral de confianza, por encima del presupuesto por ejecución ni contra cuentas y dominios protegidos. Los guardarraíles se ejecutan en código, no en el prompt.
+- **Defensa contra inyección de prompt.** El contenido del snapshot se trata como datos no confiables y nunca como instrucciones.
 - **Comparación de tokens en tiempo constante.** El token candidato y el esperado se hashean y se comparan con un acumulador XOR.
 - **Listas de Origin/Host.** `MCP_ALLOWED_ORIGINS` / `MCP_ALLOWED_HOSTNAMES` permiten restringir el acceso de navegadores y Hosts.
 - **Source maps.** `upload_source_maps` mantiene legibles las trazas en el panel sin enviarlas a los clientes.
@@ -268,7 +348,7 @@ Si encuentras un problema de seguridad, abre un reporte privado a través de Git
 
 ```
 src/
-  index.ts                  Entrada del worker: rutas, auth, endpoints
+  index.ts                  Entrada del worker: rutas, auth, endpoints, export del DO
   config.ts                 Parseo de entorno y valores por defecto
   auth.ts                   Autenticación bearer y comparación de secretos
   activitypub/
@@ -276,15 +356,24 @@ src/
     types.ts                Formas compartidas de los payloads de la API
   mcp/
     server.ts               Fábrica del servidor MCP y catálogo de herramientas
-    context.ts              Contexto de herramientas por petición (clientes perezosos)
+    context.ts              Contexto de herramientas por petición (clientes + env)
     result.ts               Utilidades de resultado de herramientas
     tools/                  Un módulo por dominio administrativo
+  sentinel/
+    agent.ts                Centinela: agente en Durable Object con SQLite
+    analyze.ts              Prompt de Workers AI y análisis estructurado
+    snapshot.ts             Recopilación del snapshot de la instancia
+    policy.ts               Guardarraíles deterministas y validación de ajustes
+    defaults.ts             Configuración sembrada desde el entorno
+    types.ts                Tipos del Centinela y catálogo de acciones
   web/
-    health.ts               Recopilación del informe de salud
+    health.ts               Recopilación del informe de salud (incluye el Centinela)
     index-page.ts           Renderizador de la página de inicio pública
 test/
   index.spec.ts             Pruebas de rutas del worker y del protocolo MCP
   config.spec.ts            Pruebas unitarias de configuración y auth
+  client.spec.ts            Pruebas unitarias del cliente de ActivityPub
+  sentinel.spec.ts          Pruebas de política, análisis y Durable Object del Centinela
 ```
 
 ## Notas de despliegue
@@ -295,7 +384,7 @@ test/
 4. Ejecuta `npm run deploy` y abre `https://mcp.example.com/` para verificar las métricas de salud.
 5. La observabilidad ya está habilitada: traces, logs e issues en tiempo real están disponibles en el panel de Cloudflare, en la pestaña **Observability** del worker.
 
-El worker no necesita Durable Objects, KV, R2 ni D1: es sin estado y funciona enteramente a través de la API de la instancia.
+El primer despliegue aplica la migración `v1` y crea la clase Durable Object `SentinelAgent` con almacenamiento SQLite. Los endpoints MCP siguen siendo sin estado y funcionan enteramente a través de la API de la instancia; solo Centinela usa almacenamiento de Durable Objects, Workers AI y alarmas.
 
 ## Licencia
 

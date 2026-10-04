@@ -11,6 +11,8 @@
  *                      revoked or rotated without touching the instance.
  */
 
+import type { SentinelAgent } from "./sentinel/agent";
+
 export interface AppEnv {
 	/** Public base URL of the CF ActivityPub instance, e.g. `https://social.example.com`. */
 	ACTIVITYPUB_URL?: string;
@@ -26,6 +28,24 @@ export interface AppEnv {
 	MCP_AUTH_TOKEN?: string;
 	/** Secret: bearer token for the CF ActivityPub admin API. */
 	ADMIN_TOKEN?: string;
+
+	/** Workers AI binding used by the Sentinel agent. */
+	AI?: Ai;
+	/** Sentinel agent Durable Object namespace. */
+	SENTINEL?: DurableObjectNamespace<SentinelAgent>;
+
+	/** Sentinel defaults (seed the agent on first boot). */
+	SENTINEL_ENABLED?: string;
+	SENTINEL_MODE?: string;
+	SENTINEL_INTERVAL_SECONDS?: string;
+	SENTINEL_MODEL?: string;
+	SENTINEL_MAX_ACTIONS?: string;
+	SENTINEL_MIN_CONFIDENCE?: string;
+	SENTINEL_COOLDOWN_HOURS?: string;
+	SENTINEL_DAILY_NEURON_BUDGET?: string;
+	SENTINEL_ALLOWED_ACTIONS?: string;
+	SENTINEL_PROTECTED_DOMAINS?: string;
+	SENTINEL_NOTIFY_WEBHOOK?: string;
 }
 
 export interface McpConfig {
